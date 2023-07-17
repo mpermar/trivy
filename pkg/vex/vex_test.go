@@ -144,6 +144,23 @@ func TestVEX_Filter(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "CSAF",
+			fields: fields{
+				filePath: "testdata/csaf.json",
+			},
+			args: args{
+				vulns: []types.DetectedVulnerability{
+					{
+						VulnerabilityID:  "CVE-2021-44228",
+						PkgName:          "spring-boot",
+						InstalledVersion: "2.6.0",
+						PkgRef:           "pkg:maven/org.springframework.boot/spring-boot@2.6.0",
+					},
+				},
+			},
+			want: []types.DetectedVulnerability{},
+		},
 	}
 
 	for _, tt := range tests {
