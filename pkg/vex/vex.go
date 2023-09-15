@@ -19,6 +19,8 @@ import (
 	"github.com/aquasecurity/trivy/pkg/sbom"
 	"github.com/aquasecurity/trivy/pkg/sbom/cyclonedx"
 	"github.com/aquasecurity/trivy/pkg/types"
+
+	csaf "github.com/csaf-poc/csaf_distribution/v2/csaf"
 )
 
 // VEX represents Vulnerability Exploitability eXchange. It abstracts multiple VEX formats.
@@ -36,6 +38,11 @@ type Statement struct {
 }
 
 type OpenVEX struct {
+	statements []Statement
+	logger     *zap.SugaredLogger
+}
+
+type CSAF struct {
 	statements []Statement
 	logger     *zap.SugaredLogger
 }
@@ -74,6 +81,7 @@ func newOpenVEX(cycloneDX *ftypes.CycloneDX, vex openvex.VEX) VEX {
 
 func (v *OpenVEX) Filter(vulns []types.DetectedVulnerability) []types.DetectedVulnerability {
 	return lo.Filter(vulns, func(vuln types.DetectedVulnerability, _ int) bool {
+		log.Logger.Infof("Filtering with filter %s", "OpenVEX")
 		stmt, ok := lo.Find(v.statements, func(item Statement) bool {
 			return item.VulnerabilityID == vuln.VulnerabilityID
 		})
@@ -125,6 +133,7 @@ func newCycloneDX(sbom *ftypes.CycloneDX, vex *cdx.BOM) *CycloneDX {
 
 func (v *CycloneDX) Filter(vulns []types.DetectedVulnerability) []types.DetectedVulnerability {
 	return lo.Filter(vulns, func(vuln types.DetectedVulnerability, _ int) bool {
+		log.Logger.Infof("Filtering with filter %s", "CycloneDX")
 		stmt, ok := lo.Find(v.statements, func(item Statement) bool {
 			return item.VulnerabilityID == vuln.VulnerabilityID
 		})
@@ -239,125 +248,65 @@ func decodeOpenVEX(r io.ReadSeeker, report types.Report) (VEX, error) {
 	return newOpenVEX(report.CycloneDX, openVEX), nil
 }
 
-type CSAF struct {
-	statements []Statement
-	logger     *zap.SugaredLogger
-}
-
-type CSAF_VEX struct {
-	Vulnerabilities []CSAF_Vulnerability `json:"vulnerabilities"`
-	ProductTree     CSAF_Product_Tree    `json:"product_tree"`
-}
-
-type CSAF_Product_Tree struct {
-	Branches []CSAF_Branches `json:"branches"`
-}
-
-type CSAF_Branches struct {
-	Category string          `json:"category"`
-	Name     string          `json:"name"`
-	Branches []CSAF_Branches `json:"branches"`
-	Product  CSAF_Product    `json:"product"`
-}
-
-type CSAF_Product struct {
-	Name                        string                             `json:"name"`
-	ProductId                   string                             `json:"product_id"`
-	ProductIdentificationHelper CSAF_Product_Identification_Helper `json:"product_identification_helper"`
-}
-
-type CSAF_Product_Identification_Helper struct {
-	PackageUrl string `json:"purl"`
-}
-
-type CSAF_Vulnerability struct {
-	Cve           string              `json:"cve"`
-	ProductStatus CSAF_Product_Status `json:"product_status"`
-}
-
-type CSAF_Product_Status struct {
-	//TODO: Add all remaining statuses
-	KnownAffected    []string `json:"known_affected"`
-	KnownNotAffected []string `json:"known_not_affected"`
-	Fixed            []string `json:"fixed"`
-}
-
 func decodeCSAFJSON(r io.ReadSeeker, report types.Report) (VEX, error) {
 
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return nil, xerrors.Errorf("seek error: %w", err)
 	}
-	var vex CSAF_VEX
-	if err := json.NewDecoder(r).Decode(&vex); err != nil {
+	var adv csaf.Advisory
+	if err := json.NewDecoder(r).Decode(&adv); err != nil {
 		return nil, err
 	}
-	return newCSAF(report.CycloneDX, vex), nil
+	return newCSAF(report.CycloneDX, adv), nil
 }
 
-func findProductPackageUrls(vex CSAF_VEX, product_ids []string) []string {
+func findProductPackageUrls(adv csaf.Advisory, products *csaf.Products) []string {
 
-	var product_urls []string
-	for _, product_id := range product_ids {
-		var product_url = findProductPackageUrl(product_id, vex.ProductTree.Branches[0]) //TODO loop on branches
-		if product_url != "" {
-			product_urls = append(product_urls, product_url)
-		}
-	}
-	return product_urls
+	var csafPurlFinder = newURLFinder(*products)
+	csafPurlFinder.findURLs(&adv)
+	csafPurlFinder.dumpURLs()
+
+	return csafPurlFinder.getFoundURLs()
 }
 
-func findProductPackageUrl(product_id string, branches CSAF_Branches) string {
-
-	if branches.Product.ProductId == product_id {
-		return branches.Product.ProductIdentificationHelper.PackageUrl
-	}
-	if branches.Branches != nil {
-		return findProductPackageUrl(product_id, branches.Branches[0]) //TODO loop on branches
-	}
-	return ""
-}
-
-func newCSAF(cycloneDX *ftypes.CycloneDX, vex CSAF_VEX) VEX {
+func newCSAF(cycloneDX *ftypes.CycloneDX, adv csaf.Advisory) VEX {
 	var stmts []Statement
 	logger := log.Logger.With(zap.String("VEX format", "CSAF"))
 
-	for _, vuln := range vex.Vulnerabilities {
+	log.Logger.Infof("Detected VEX format: %s", "CSAF")
+
+	for _, vuln := range adv.Vulnerabilities {
 		// loop over product statuses as CSAF supports multiple products
 
 		//TODO: Need some proper golang looping here
 		if vuln.ProductStatus.Fixed != nil {
 			stmts = append(stmts, Statement{
-				VulnerabilityID: vuln.Cve,
-				Affects:         findProductPackageUrls(vex, vuln.ProductStatus.Fixed),
+				VulnerabilityID: string(*vuln.CVE),
+				Affects:         findProductPackageUrls(adv, vuln.ProductStatus.Fixed),
 				Status:          StatusFixed,
 				Justification:   "TODO",
 			})
 		}
 		if vuln.ProductStatus.KnownAffected != nil {
 			stmts = append(stmts, Statement{
-				VulnerabilityID: vuln.Cve,
-				Affects:         findProductPackageUrls(vex, vuln.ProductStatus.KnownAffected),
+				VulnerabilityID: string(*vuln.CVE),
+				Affects:         findProductPackageUrls(adv, vuln.ProductStatus.KnownAffected),
 				Status:          StatusAffected,
 				Justification:   "TODO",
 			})
 		}
 		if vuln.ProductStatus.KnownNotAffected != nil {
 			stmts = append(stmts, Statement{
-				VulnerabilityID: vuln.Cve,
-				Affects:         findProductPackageUrls(vex, vuln.ProductStatus.KnownNotAffected),
+				VulnerabilityID: string(*vuln.CVE),
+				Affects:         findProductPackageUrls(adv, vuln.ProductStatus.KnownNotAffected),
 				Status:          StatusNotAffected,
 				Justification:   "TODO",
 			})
 		}
 	}
 
-	if cycloneDX != nil {
-		return &CycloneDX{
-			sbom:       cycloneDX,
-			statements: stmts,
-			logger:     logger,
-		}
-	}
+	log.Logger.Infof("Found the following VEX statements: %w", stmts)
+
 	return &CSAF{
 		statements: stmts,
 		logger:     logger,
@@ -366,6 +315,7 @@ func newCSAF(cycloneDX *ftypes.CycloneDX, vex CSAF_VEX) VEX {
 
 func (v *CSAF) Filter(vulns []types.DetectedVulnerability) []types.DetectedVulnerability {
 	return lo.Filter(vulns, func(vuln types.DetectedVulnerability, _ int) bool {
+		log.Logger.Infof("Filtering with filter %s", "CSAF")
 		stmt, ok := lo.Find(v.statements, func(item Statement) bool {
 			return item.VulnerabilityID == vuln.VulnerabilityID
 		})
@@ -382,6 +332,9 @@ func (v *CSAF) affected(vuln types.DetectedVulnerability, stmt Statement) bool {
 		v.logger.Infow("Filtered out the detected vulnerability", zap.String("vulnerability-id", vuln.VulnerabilityID),
 			zap.String("status", string(stmt.Status)), zap.String("justification", stmt.Justification))
 		return false
+	} else {
+		v.logger.Infow("Could not filter", zap.String("vulnerability-id", vuln.VulnerabilityID),
+			zap.String("status", string(stmt.Status)), zap.String("justification", stmt.Justification))
 	}
 	return true
 }
